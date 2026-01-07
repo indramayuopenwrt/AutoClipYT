@@ -3,59 +3,42 @@ import asyncio
 import uuid
 import shutil
 import subprocess
-from datetime import datetime
 from collections import deque
 
 from fastapi import FastAPI, Request
-from telegram import Update, Bot
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-import whisper
-
-# ================== CONFIG ==================
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8080))
 
-MAX_DURATION = 300  # detik
 BASE_DIR = "/tmp/autoclip"
-WATERMARK = "watermark.png"
+MAX_DURATION = 300
 
 os.makedirs(BASE_DIR, exist_ok=True)
 
-# ================== GLOBAL ==================
+# ================= GLOBAL =================
 queue = deque()
 processing = False
-usage_stats = {
-    "jobs": 0,
-    "users": set()
-}
 
-# ================== UTILS ==================
+# ================= UTILS =================
 def run(cmd):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def ts(sec):
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
-    return f"{h:02}:{m:02}:{s:06.3f}".replace(".", ",")
-
 def parse_time(t):
-    p = list(map(int, t.split(":")))
-    if len(p) == 2:
-        return p[0]*60 + p[1]
-    return p[0]*3600 + p[1]*60 + p[2]
+    parts = list(map(int, t.split(":")))
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
-# ================== WORKER ==================
+# ================= WORKER =================
 async def worker(app: Application):
     global processing
     if processing:
         return
+
     processing = True
 
     while queue:
@@ -63,58 +46,23 @@ async def worker(app: Application):
         chat_id = job["chat_id"]
         bot = app.bot
 
+        vid = f"{BASE_DIR}/{job['id']}.mp4"
+        cut = f"{BASE_DIR}/{job['id']}_cut.mp4"
+        out = f"{BASE_DIR}/{job['id']}_final.mp4"
+
         try:
-            await bot.send_message(chat_id, "🎬 Processing clip...")
+            await bot.send_message(chat_id, "🎬 Processing...")
 
-            vid = f"{BASE_DIR}/{job['id']}.mp4"
-            cut = f"{BASE_DIR}/{job['id']}_cut.mp4"
-            audio = f"{BASE_DIR}/{job['id']}.wav"
-            subs = f"{BASE_DIR}/{job['id']}.srt"
-            out = f"{BASE_DIR}/{job['id']}_final.mp4"
-
-            # download
             run(["yt-dlp", "-f", job["fmt"], "-o", vid, job["url"]])
 
-            # cut
             run([
                 "ffmpeg", "-y",
                 "-ss", str(job["start"]),
                 "-to", str(job["end"]),
                 "-i", vid,
-                "-c", "copy",
-                cut
-            ])
-
-            # audio
-            run([
-                "ffmpeg", "-y", "-i", cut,
-                "-vn", "-ac", "1", "-ar", "16000", audio
-            ])
-
-            # whisper
-            model = whisper.load_model("base")
-            result = model.transcribe(audio)
-
-            with open(subs, "w") as f:
-                for i, s in enumerate(result["segments"], 1):
-                    f.write(f"{i}\n{ts(s['start'])} --> {ts(s['end'])}\n{s['text'].strip()}\n\n")
-
-            # render FINAL
-            vf = (
-                "[0:v]scale=1080:1920,boxblur=20:5[bg];"
-                "[0:v]scale=iw*min(1080/iw\\,1920/ih):ih*min(1080/iw\\,1920/ih)[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-                f"subtitles={subs}:force_style='Fontsize=48,Outline=2,Alignment=10',"
-                f"movie={WATERMARK},scale=200:-1[wm];"
-                "[in][wm]overlay=W-w-40:H-h-40[out]"
-            )
-
-            run([
-                "ffmpeg", "-y",
-                "-i", cut,
-                "-vf", vf,
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                       "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,boxblur=20",
                 "-preset", "veryfast",
-                "-movflags", "+faststart",
                 out
             ])
 
@@ -129,95 +77,64 @@ async def worker(app: Application):
 
     processing = False
 
-# ================== COMMANDS ==================
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎞 AutoClipYT\n\n"
         "/clip720 <url> <start> <end>\n"
-        "/clip1080 <url> <start> <end>\n\n"
-        "Max 300 detik | Auto Shorts"
+        "/clip1080 <url> <start> <end>\n"
+        "Max 300 detik"
     )
 
 async def clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global queue
-    args = context.args
-    if len(args) < 3:
+    if len(context.args) < 3:
         return await update.message.reply_text("❌ Format salah")
 
-    url, t1, t2 = args
-    start, end = parse_time(t1), parse_time(t2)
+    url, t1, t2 = context.args
+    start = parse_time(t1)
+    end = parse_time(t2)
 
     if end - start > MAX_DURATION:
         return await update.message.reply_text("⛔ Max 300 detik")
 
-    fmt = "bestvideo[height<=720]+bestaudio/best" \
-        if update.message.text.startswith("/clip720") \
+    fmt = (
+        "bestvideo[height<=720]+bestaudio/best"
+        if update.message.text.startswith("/clip720")
         else "bestvideo[height<=1080]+bestaudio/best"
+    )
 
-    job = {
+    queue.append({
         "id": str(uuid.uuid4()),
         "chat_id": update.message.chat_id,
         "url": url,
         "start": start,
         "end": end,
         "fmt": fmt,
-    }
+    })
 
-    queue.append(job)
-    usage_stats["jobs"] += 1
-    usage_stats["users"].add(update.message.chat_id)
-
-    await update.message.reply_text(
-        f"📥 Masuk antrean\n"
-        f"📊 Queue: {len(queue)}"
-    )
-
+    await update.message.reply_text(f"📥 Masuk antrean ({len(queue)})")
     asyncio.create_task(worker(context.application))
 
-# ================== APP ==================
+# ================= FASTAPI =================
 app = FastAPI()
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+tg_app = Application.builder().token(BOT_TOKEN).build()
 
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("clip720", clip))
-telegram_app.add_handler(CommandHandler("clip1080", clip))
+tg_app.add_handler(CommandHandler("start", start))
+tg_app.add_handler(CommandHandler("clip720", clip))
+tg_app.add_handler(CommandHandler("clip1080", clip))
 
 @app.post("/")
 async def webhook(req: Request):
     data = await req.json()
-    await telegram_app.update_queue.put(Update.de_json(data, telegram_app.bot))
+    await tg_app.update_queue.put(Update.de_json(data, tg_app.bot))
     return {"ok": True}
 
 @app.on_event("startup")
-async def on_start():
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+async def startup():
+    await tg_app.initialize()
+    await tg_app.bot.set_webhook(WEBHOOK_URL)
 
-# ================== RUN ==================
+# ================= RUN =================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT) stats_cmd(update, context):
-    await update.message.reply_text(
-        f"📊 Statistik Bot\n\n"
-        f"🎬 Total clip: {stats['total_jobs']}\n"
-        f"⏱ Total durasi: {stats['total_duration']} detik\n"
-        f"📺 720p: {stats['resolution']['720']}\n"
-        f"📺 1080p: {stats['resolution']['1080']}\n"
-        f"⚡ Avg process: {stats['avg_process']} detik"
-    )
-
-# ================= START =================
-app = Application.builder().token(BOT_TOKEN).build()
-
-app.add_handler(CommandHandler("clip720", clip720))
-app.add_handler(CommandHandler("clip1080", clip1080))
-app.add_handler(CommandHandler("cancel", cancel))
-app.add_handler(CommandHandler("stats", stats_cmd))
-
-app.post_init = lambda app: asyncio.create_task(worker(app))
-
-app.run_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    webhook_url=WEBHOOK_URL
-)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
