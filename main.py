@@ -1,40 +1,198 @@
-import os, re, time, json, asyncio, subprocess
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import os
+import asyncio
+import uuid
+import time
+import shutil
+from collections import deque, defaultdict
+from typing import Dict
 
-# ================= ENV =================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
-# ================= PROFILE =================
-PROFILES = {
-    "720":  {"v": 2500, "a": 128, "max": 60, "scale": "1280:720"},
-    "1080": {"v": 5000, "a": 128, "max": 30, "scale": "1920:1080"},
-}
+if not BOT_TOKEN or not WEBHOOK_URL:
+    raise RuntimeError("BOT_TOKEN & WEBHOOK_URL wajib di-set di Railway Variables")
 
-# ================= GLOBAL =================
-queue = asyncio.Queue()
-jobs = {}
-avg_time = 20
-STATS_FILE = "stats.json"
+# =========================
+# GLOBAL STATE
+# =========================
+queue = deque()
+active_job = None
+cancel_flags: Dict[str, bool] = {}
+stats = defaultdict(int)
 
-# ================= STATS =================
-def load_stats():
-    if not os.path.exists(STATS_FILE):
-        return {
-            "total_jobs": 0,
-            "total_duration": 0,
-            "resolution": {"720": 0, "1080": 0},
-            "users": {},
-            "avg_process": 0
-        }
-    with open(STATS_FILE) as f:
-        return json.load(f)
+TMP_DIR = "/tmp/clips"
+os.makedirs(TMP_DIR, exist_ok=True)
 
-def save_stats():
-    with open(STATS_FILE, "w") as f:
-        json.dump(stats, f)
+# =========================
+# UTIL
+# =========================
+def parse_time(t: str) -> int:
+    if ":" in t:
+        parts = list(map(int, t.split(":")))
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return int(t)
+
+def estimate_size(duration: int, res: int) -> float:
+    bitrate = 6 if res == 1080 else 3
+    return round((duration * bitrate) / 8, 2)  # MB
+
+# =========================
+# COMMANDS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎬 AutoClipYT\n"
+        "/clip1080 <url> <start> <end>\n"
+        "/clip720 <url> <start> <end>\n"
+        "/cancel\n"
+        "/stats"
+    )
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"📊 Statistik\n"
+        f"Jobs selesai: {stats['done']}\n"
+        f"Jobs batal: {stats['cancel']}\n"
+        f"Total request: {stats['total']}"
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if active_job:
+        cancel_flags[active_job["id"]] = True
+        await update.message.reply_text("🛑 Job dibatalkan")
+    else:
+        await update.message.reply_text("Tidak ada job aktif")
+
+async def clip(update: Update, context: ContextTypes.DEFAULT_TYPE, res: int):
+    try:
+        url, start, end = context.args
+        s = parse_time(start)
+        e = parse_time(end)
+        dur = e - s
+        if dur <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Format salah")
+        return
+
+    job_id = str(uuid.uuid4())
+    queue.append({
+        "id": job_id,
+        "chat": update.effective_chat.id,
+        "url": url,
+        "start": s,
+        "end": e,
+        "res": res,
+    })
+
+    stats["total"] += 1
+    size = estimate_size(dur, res)
+
+    await update.message.reply_text(
+        f"⏳ Masuk antrean\n"
+        f"Estimasi ukuran: {size} MB\n"
+        f"Posisi antrean: {len(queue)}"
+    )
+
+async def clip1080(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await clip(update, context, 1080)
+
+async def clip720(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await clip(update, context, 720)
+
+# =========================
+# WORKER
+# =========================
+async def worker(app):
+    global active_job
+
+    while True:
+        if not queue or active_job:
+            await asyncio.sleep(1)
+            continue
+
+        job = queue.popleft()
+        active_job = job
+        jid = job["id"]
+        cancel_flags[jid] = False
+
+        chat = job["chat"]
+        out = f"{TMP_DIR}/{jid}.mp4"
+
+        try:
+            await app.bot.send_message(chat, "⚡ Processing...")
+
+            cmd = (
+                f'yt-dlp -f "bv*[height<={job["res"]}]+ba/b" '
+                f'-o - "{job["url"]}" | '
+                f'ffmpeg -y -i pipe:0 -ss {job["start"]} -to {job["end"]} '
+                f'-c copy "{out}"'
+            )
+
+            proc = await asyncio.create_subprocess_shell(cmd)
+            while proc.returncode is None:
+                if cancel_flags[jid]:
+                    proc.kill()
+                    raise asyncio.CancelledError
+                await asyncio.sleep(1)
+
+            await app.bot.send_video(chat, video=open(out, "rb"))
+            stats["done"] += 1
+
+        except asyncio.CancelledError:
+            await app.bot.send_message(chat, "❌ Job dibatalkan")
+            stats["cancel"] += 1
+
+        except Exception as e:
+            await app.bot.send_message(chat, f"Error: {e}")
+
+        finally:
+            if os.path.exists(out):
+                os.remove(out)
+            active_job = None
+
+# =========================
+# STARTUP
+# =========================
+async def on_startup(app):
+    app.create_task(worker(app))
+
+# =========================
+# MAIN
+# =========================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("clip1080", clip1080))
+    app.add_handler(CommandHandler("clip720", clip720))
+
+    app.post_init = on_startup
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL,
+    )
+
+if __name__ == "__main__":
+    main()        json.dump(stats, f)
 
 stats = load_stats()
 
