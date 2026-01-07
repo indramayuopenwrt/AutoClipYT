@@ -1,352 +1,202 @@
 import os
 import asyncio
 import uuid
-import time
 import shutil
-from collections import deque, defaultdict
-from typing import Dict
+import subprocess
+from datetime import datetime
+from collections import deque
 
-from telegram import Update
+from fastapi import FastAPI, Request
+from telegram import Update, Bot
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     ContextTypes,
 )
 
-# =========================
-# ENV
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8080))
+import whisper
 
-if not BOT_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("BOT_TOKEN & WEBHOOK_URL wajib di-set di Railway Variables")
+# ================== CONFIG ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.up.railway.app
+PORT = int(os.getenv("PORT", 8080))
 
-# =========================
-# GLOBAL STATE
-# =========================
+MAX_DURATION = 300  # detik
+BASE_DIR = "/tmp/autoclip"
+WATERMARK = "watermark.png"
+
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# ================== GLOBAL ==================
 queue = deque()
-active_job = None
-cancel_flags: Dict[str, bool] = {}
-stats = defaultdict(int)
+processing = False
+usage_stats = {
+    "jobs": 0,
+    "users": set()
+}
 
-TMP_DIR = "/tmp/clips"
-os.makedirs(TMP_DIR, exist_ok=True)
+# ================== UTILS ==================
+def run(cmd):
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# =========================
-# UTIL
-# =========================
-def parse_time(t: str) -> int:
-    if ":" in t:
-        parts = list(map(int, t.split(":")))
-        if len(parts) == 2:
-            return parts[0] * 60 + parts[1]
-        if len(parts) == 3:
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    return int(t)
+def ts(sec):
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h:02}:{m:02}:{s:06.3f}".replace(".", ",")
 
-def estimate_size(duration: int, res: int) -> float:
-    bitrate = 6 if res == 1080 else 3
-    return round((duration * bitrate) / 8, 2)  # MB
+def parse_time(t):
+    p = list(map(int, t.split(":")))
+    if len(p) == 2:
+        return p[0]*60 + p[1]
+    return p[0]*3600 + p[1]*60 + p[2]
 
-# =========================
-# COMMANDS
-# =========================
+# ================== WORKER ==================
+async def worker(app: Application):
+    global processing
+    if processing:
+        return
+    processing = True
+
+    while queue:
+        job = queue.popleft()
+        chat_id = job["chat_id"]
+        bot = app.bot
+
+        try:
+            await bot.send_message(chat_id, "🎬 Processing clip...")
+
+            vid = f"{BASE_DIR}/{job['id']}.mp4"
+            cut = f"{BASE_DIR}/{job['id']}_cut.mp4"
+            audio = f"{BASE_DIR}/{job['id']}.wav"
+            subs = f"{BASE_DIR}/{job['id']}.srt"
+            out = f"{BASE_DIR}/{job['id']}_final.mp4"
+
+            # download
+            run(["yt-dlp", "-f", job["fmt"], "-o", vid, job["url"]])
+
+            # cut
+            run([
+                "ffmpeg", "-y",
+                "-ss", str(job["start"]),
+                "-to", str(job["end"]),
+                "-i", vid,
+                "-c", "copy",
+                cut
+            ])
+
+            # audio
+            run([
+                "ffmpeg", "-y", "-i", cut,
+                "-vn", "-ac", "1", "-ar", "16000", audio
+            ])
+
+            # whisper
+            model = whisper.load_model("base")
+            result = model.transcribe(audio)
+
+            with open(subs, "w") as f:
+                for i, s in enumerate(result["segments"], 1):
+                    f.write(f"{i}\n{ts(s['start'])} --> {ts(s['end'])}\n{s['text'].strip()}\n\n")
+
+            # render FINAL
+            vf = (
+                "[0:v]scale=1080:1920,boxblur=20:5[bg];"
+                "[0:v]scale=iw*min(1080/iw\\,1920/ih):ih*min(1080/iw\\,1920/ih)[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+                f"subtitles={subs}:force_style='Fontsize=48,Outline=2,Alignment=10',"
+                f"movie={WATERMARK},scale=200:-1[wm];"
+                "[in][wm]overlay=W-w-40:H-h-40[out]"
+            )
+
+            run([
+                "ffmpeg", "-y",
+                "-i", cut,
+                "-vf", vf,
+                "-preset", "veryfast",
+                "-movflags", "+faststart",
+                out
+            ])
+
+            await bot.send_video(chat_id, video=open(out, "rb"))
+
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ Error: {e}")
+
+        finally:
+            shutil.rmtree(BASE_DIR, ignore_errors=True)
+            os.makedirs(BASE_DIR, exist_ok=True)
+
+    processing = False
+
+# ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎬 AutoClipYT\n"
-        "/clip1080 <url> <start> <end>\n"
+        "🎞 AutoClipYT\n\n"
         "/clip720 <url> <start> <end>\n"
-        "/cancel\n"
-        "/stats"
+        "/clip1080 <url> <start> <end>\n\n"
+        "Max 300 detik | Auto Shorts"
     )
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"📊 Statistik\n"
-        f"Jobs selesai: {stats['done']}\n"
-        f"Jobs batal: {stats['cancel']}\n"
-        f"Total request: {stats['total']}"
-    )
+async def clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global queue
+    args = context.args
+    if len(args) < 3:
+        return await update.message.reply_text("❌ Format salah")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if active_job:
-        cancel_flags[active_job["id"]] = True
-        await update.message.reply_text("🛑 Job dibatalkan")
-    else:
-        await update.message.reply_text("Tidak ada job aktif")
+    url, t1, t2 = args
+    start, end = parse_time(t1), parse_time(t2)
 
-async def clip(update: Update, context: ContextTypes.DEFAULT_TYPE, res: int):
-    try:
-        url, start, end = context.args
-        s = parse_time(start)
-        e = parse_time(end)
-        dur = e - s
-        if dur <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("Format salah")
-        return
+    if end - start > MAX_DURATION:
+        return await update.message.reply_text("⛔ Max 300 detik")
 
-    job_id = str(uuid.uuid4())
-    queue.append({
-        "id": job_id,
-        "chat": update.effective_chat.id,
+    fmt = "bestvideo[height<=720]+bestaudio/best" \
+        if update.message.text.startswith("/clip720") \
+        else "bestvideo[height<=1080]+bestaudio/best"
+
+    job = {
+        "id": str(uuid.uuid4()),
+        "chat_id": update.message.chat_id,
         "url": url,
-        "start": s,
-        "end": e,
-        "res": res,
-    })
+        "start": start,
+        "end": end,
+        "fmt": fmt,
+    }
 
-    stats["total"] += 1
-    size = estimate_size(dur, res)
+    queue.append(job)
+    usage_stats["jobs"] += 1
+    usage_stats["users"].add(update.message.chat_id)
 
-    await update.message.reply_text(
-        f"⏳ Masuk antrean\n"
-        f"Estimasi ukuran: {size} MB\n"
-        f"Posisi antrean: {len(queue)}"
-    )
-
-async def clip1080(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await clip(update, context, 1080)
-
-async def clip720(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await clip(update, context, 720)
-
-# =========================
-# WORKER
-# =========================
-async def worker(app):
-    global active_job
-
-    while True:
-        if not queue or active_job:
-            await asyncio.sleep(1)
-            continue
-
-        job = queue.popleft()
-        active_job = job
-        jid = job["id"]
-        cancel_flags[jid] = False
-
-        chat = job["chat"]
-        out = f"{TMP_DIR}/{jid}.mp4"
-
-        try:
-            await app.bot.send_message(chat, "⚡ Processing...")
-
-            cmd = (
-                f'yt-dlp -f "bv*[height<={job["res"]}]+ba/b" '
-                f'-o - "{job["url"]}" | '
-                f'ffmpeg -y -i pipe:0 -ss {job["start"]} -to {job["end"]} '
-                f'-c copy "{out}"'
-            )
-
-            proc = await asyncio.create_subprocess_shell(cmd)
-            while proc.returncode is None:
-                if cancel_flags[jid]:
-                    proc.kill()
-                    raise asyncio.CancelledError
-                await asyncio.sleep(1)
-
-            await app.bot.send_video(chat, video=open(out, "rb"))
-            stats["done"] += 1
-
-        except asyncio.CancelledError:
-            await app.bot.send_message(chat, "❌ Job dibatalkan")
-            stats["cancel"] += 1
-
-        except Exception as e:
-            await app.bot.send_message(chat, f"Error: {e}")
-
-        finally:
-            if os.path.exists(out):
-                os.remove(out)
-            active_job = None
-
-# =========================
-# STARTUP
-# =========================
-async def on_startup(app):
-    app.create_task(worker(app))
-
-# =========================
-# MAIN
-# =========================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("clip1080", clip1080))
-    app.add_handler(CommandHandler("clip720", clip720))
-
-    app.post_init = on_startup
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL,
-    )
-
-if __name__ == "__main__":
-    main()        json.dump(stats, f)
-
-stats = load_stats()
-
-# ================= UTILS =================
-def parse_time(t):
-    if ":" in t:
-        p = list(map(int, t.split(":")))
-        return p[-1] + (p[-2] * 60) + (p[-3] * 3600 if len(p) == 3 else 0)
-    if t.isdigit():
-        return int(t)
-    m = re.match(r"(?:(\d+)m)?(?:(\d+)s)?", t)
-    return int(m.group(1) or 0) * 60 + int(m.group(2) or 0)
-
-def estimate_size(profile, dur):
-    p = PROFILES[profile]
-    return round((p["v"] + p["a"]) * dur / 8 / 1024, 2)
-
-def bar(p):
-    return "█" * (p // 10) + "░" * (10 - p // 10)
-
-# ================= QUEUE =================
-async def enqueue(update, context, profile):
-    if len(context.args) != 3:
-        await update.message.reply_text(
-            f"Format:\n/{context.command} <url> <start> <durasi>"
-        )
-        return
-
-    url, start, dur = context.args
-    dur_s = parse_time(dur)
-
-    if dur_s > PROFILES[profile]["max"]:
-        await update.message.reply_text(
-            f"❌ Max {profile}p = {PROFILES[profile]['max']} detik"
-        )
-        return
-
-    size = estimate_size(profile, dur_s)
-    if size > 48:
-        await update.message.reply_text(
-            f"❌ Estimasi {size} MB (>50MB)\nGunakan resolusi lebih rendah"
-        )
-        return
-
-    pos = queue.qsize() + 1
-    eta = pos * avg_time
-
-    await queue.put((update, context, profile))
     await update.message.reply_text(
         f"📥 Masuk antrean\n"
-        f"🎬 {profile}p | 📦 {size}MB\n"
-        f"⏱ ETA ~{eta}s"
+        f"📊 Queue: {len(queue)}"
     )
 
-# ================= WORKER =================
-async def worker(app):
-    global avg_time
-    while True:
-        update, context, profile = await queue.get()
-        uid = update.effective_user.id
-        start_t = time.time()
+    asyncio.create_task(worker(context.application))
 
-        msg = await update.message.reply_text("⏳ Processing...")
-        output = f"clip_{uid}.mp4"
+# ================== APP ==================
+app = FastAPI()
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-        try:
-            url, start, dur = context.args
-            start_s = parse_time(start)
-            dur_s = parse_time(dur)
-            p = PROFILES[profile]
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("clip720", clip))
+telegram_app.add_handler(CommandHandler("clip1080", clip))
 
-            ytdlp = subprocess.Popen(
-                ["yt-dlp", "-f", f"bv*[height={profile}]/bv*", "-o", "-", url],
-                stdout=subprocess.PIPE
-            )
+@app.post("/")
+async def webhook(req: Request):
+    data = await req.json()
+    await telegram_app.update_queue.put(Update.de_json(data, telegram_app.bot))
+    return {"ok": True}
 
-            ffmpeg = subprocess.Popen(
-                [
-                    "ffmpeg", "-y",
-                    "-ss", str(start_s),
-                    "-i", "pipe:0",
-                    "-t", str(dur_s),
-                    "-vf", f"scale={p['scale']}",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-b:v", f"{p['v']}k",
-                    "-c:a", "aac",
-                    "-b:a", f"{p['a']}k",
-                    "-progress", "pipe:1",
-                    "-nostats",
-                    output
-                ],
-                stdin=ytdlp.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
-            )
+@app.on_event("startup")
+async def on_start():
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
 
-            jobs[uid] = ffmpeg
-            last = 0
-            dur_ms = dur_s * 1_000_000
-
-            for line in ffmpeg.stdout:
-                if "out_time_ms" in line:
-                    ms = int(line.split("=")[1])
-                    pct = min(100, int(ms / dur_ms * 100))
-                    if pct - last >= 5:
-                        await msg.edit_text(
-                            f"🎬 Processing\n{bar(pct)} {pct}%"
-                        )
-                        last = pct
-
-            ffmpeg.wait()
-            await msg.edit_text("📤 Uploading...")
-            await update.message.reply_video(video=open(output, "rb"))
-
-            # ==== STATS UPDATE ====
-            stats["total_jobs"] += 1
-            stats["total_duration"] += dur_s
-            stats["resolution"][profile] += 1
-            stats["users"][str(uid)] = stats["users"].get(str(uid), 0) + 1
-            elapsed = int(time.time() - start_t)
-            stats["avg_process"] = int(
-                (stats["avg_process"] + elapsed) / 2
-            )
-            save_stats()
-
-            avg_time = int((avg_time + elapsed) / 2)
-
-        except Exception as e:
-            await msg.edit_text(f"❌ Error: {e}")
-
-        finally:
-            jobs.pop(uid, None)
-            if os.path.exists(output):
-                os.remove(output)
-            queue.task_done()
-
-# ================= COMMANDS =================
-async def clip720(update, context):
-    await enqueue(update, context, "720")
-
-async def clip1080(update, context):
-    await enqueue(update, context, "1080")
-
-async def cancel(update, context):
-    uid = update.effective_user.id
-    if uid in jobs:
-        jobs[uid].kill()
-        await update.message.reply_text("❌ Job dibatalkan")
-    else:
-        await update.message.reply_text("⚠️ Tidak ada job aktif")
-
-async def stats_cmd(update, context):
+# ================== RUN ==================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT) stats_cmd(update, context):
     await update.message.reply_text(
         f"📊 Statistik Bot\n\n"
         f"🎬 Total clip: {stats['total_jobs']}\n"
